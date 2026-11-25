@@ -4,18 +4,18 @@ import QtQuick.Layouts
 import MuseScore 3.0
 
 MuseScore {
-    id: breaksToParts
+    id: applyLayoutToParts
 
     title: qsTr("Apply Layout to Parts")
-    description: qsTr("Locks in the current layout of the score or active part and applies the same breaks and system locks to selected parts.")
-    version: "2.0"
+    description: qsTr("Locks in the current layout of the score or active part and applies the same to selected parts.")
+    version: "2.1"
     categoryCode: "composing-arranging-tools"
     thumbnailName: "thumbnail.png"
     pluginType: "dialog"
     requiresScore: true
 
     width: 340
-    height: 440
+    height: 470
 
     property var pendingPageBreaks: []
     property var pendingLineBreaks: []
@@ -23,6 +23,7 @@ MuseScore {
     property var pendingNoBreaks: []
     property var pendingLockedStart: []
     property var pendingLockedEnd: []
+    property var pendingFrames: []
     property bool exportSectionBreaks: false // For now section breaks cannot be part-independent
     property int currentPartIndex: -1
 
@@ -73,7 +74,10 @@ MuseScore {
 
         curScore.endCmd()
 
-        if (elements.length === 0 && measLockedSystemStart.length === 0) {
+        // Collect frame layouts and child text positions
+        pendingFrames = collectFramesData(curScore)
+
+        if (elements.length === 0 && measLockedSystemStart.length === 0 && pendingFrames.length === 0) {
             breaksError.open()
             return
         }
@@ -160,33 +164,240 @@ MuseScore {
         }
     }
 
-    function stripPartNumber(title) {
-        return title.toLowerCase().replace(/\s+(\d+|[ivx]+)$/i, "").trim()
+    function extractFramesFromScore(score) {
+        var found = []
+        var seen = []
+
+        function checkObj(obj) {
+            if (!obj || seen.indexOf(obj) !== -1)
+                return
+            seen.push(obj)
+
+            if (obj.type === Element.VBOX || obj.type === Element.HBOX || obj.type === Element.TBOX || obj.type === Element.FBOX) {
+                found.push(obj)
+            }
+        }
+
+        // 1. Check score.systems (MuseScore 4 wraps frames in System objects)
+        if (score.systems) {
+            for (var s = 0; s < score.systems.length; s++) {
+                var sys = score.systems[s]
+                if (!sys)
+                    continue
+                checkObj(sys)
+                if (sys.firstMeasure)
+                    checkObj(sys.firstMeasure)
+                if (sys.measures) {
+                    for (var m = 0; m < sys.measures.length; m++)
+                        checkObj(sys.measures[m])
+                }
+                if (sys.elements) {
+                    for (var e = 0; e < sys.elements.length; e++)
+                        checkObj(sys.elements[e])
+                }
+            }
+        }
+
+        // 2. Also check score.pages -> page.elements as a fallback
+        if (found.length === 0 && score.pages) {
+            for (var p = 0; p < score.pages.length; p++) {
+                var page = score.pages[p]
+                if (page && page.elements) {
+                    for (var pe = 0; pe < page.elements.length; pe++)
+                        checkObj(page.elements[pe])
+                }
+            }
+        }
+
+        return found
+    }
+
+    function getAnchorTickForFrame(frameObj) {
+        // Walk forward from the frame using nextMeasure / nextMeasureMM if available
+        var next = frameObj.nextMeasure || frameObj.nextMeasureMM
+        while (next) {
+            if (next.type === Element.MEASURE && next.firstSegment)
+                return next.firstSegment.tick
+            next = next.nextMeasure || next.nextMeasureMM
+        }
+        return -1
+    }
+
+    function collectFramesData(score) {
+        var frames = []
+        var rawFrames = extractFramesFromScore(score)
+        console.log("Raw frames found in source:", rawFrames.length)
+
+        for (var idx = 0; idx < rawFrames.length; idx++) {
+            var mb = rawFrames[idx]
+            var nextTick = getAnchorTickForFrame(mb)
+
+            var frameInfo = {
+                type: mb.type,
+                seqIndex: idx,
+                anchorTick: nextTick,
+                boxHeight: mb.boxHeight,
+                boxWidth: mb.boxWidth,
+                topMargin: mb.topMargin,
+                bottomMargin: mb.bottomMargin,
+                leftMargin: mb.leftMargin,
+                rightMargin: mb.rightMargin,
+                topGap: mb.topGap,
+                bottomGap: mb.bottomGap,
+                elements: []
+            }
+
+            if (mb.elements) {
+                for (var i = 0; i < mb.elements.length; i++) {
+                    var el = mb.elements[i]
+                    if (el.type === Element.TEXT) {
+                        var elData = {
+                            subStyle: el.subStyle,
+                            offsetX: el.offset.x,
+                            offsetY: el.offset.y,
+                            hasPositionProp: (typeof el.position === "number"),
+                            positionVal: (typeof el.position === "number") ? el.position : -1,
+                            hasAlignProp: (typeof el.align === "number" && el.align !== 0),
+                            alignVal: (typeof el.align === "number") ? el.align : -1
+                        }
+                        frameInfo.elements.push(elData)
+                    }
+                }
+            }
+            frames.push(frameInfo)
+        }
+        return frames
+    }
+
+    function applyFramesToPart(part, sourceFrames) {
+        if (!part || !sourceFrames || sourceFrames.length === 0)
+            return
+
+        var rawPartFrames = extractFramesFromScore(part)
+        var partFrames = []
+        for (var idx = 0; idx < rawPartFrames.length; idx++) {
+            var mb = rawPartFrames[idx]
+            partFrames.push({
+                frame: mb,
+                anchorTick: getAnchorTickForFrame(mb),
+                matched: false
+            })
+        }
+
+        for (var i = 0; i < sourceFrames.length; i++) {
+            var src = sourceFrames[i]
+            var target = null
+
+            for (var j = 0; j < partFrames.length; j++) {
+                if (!partFrames[j].matched &&
+                    partFrames[j].frame.type === src.type &&
+                    partFrames[j].anchorTick === src.anchorTick) {
+                    target = partFrames[j].frame
+                    partFrames[j].matched = true
+                    break
+                }
+            }
+
+            if (!target && i === 0 && partFrames.length > 0 && !partFrames[0].matched && partFrames[0].frame.type === src.type) {
+                target = partFrames[0].frame
+                partFrames[0].matched = true
+            }
+
+            if (!target)
+                continue
+
+            if (src.type === Element.VBOX || src.type === Element.TBOX || src.type === Element.FBOX)
+                target.boxHeight = src.boxHeight
+            if (src.type === Element.HBOX)
+                target.boxWidth = src.boxWidth
+
+            target.topMargin = src.topMargin
+            target.bottomMargin = src.bottomMargin
+            target.leftMargin = src.leftMargin
+            target.rightMargin = src.rightMargin
+            target.topGap = src.topGap
+            target.bottomGap = src.bottomGap
+
+            if (target.elements && src.elements.length > 0) {
+                for (var te = 0; te < target.elements.length; te++) {
+                    var tEl = target.elements[te]
+                    if (tEl.type !== Element.TEXT)
+                        continue
+
+                    for (var se = 0; se < src.elements.length; se++) {
+                        var sEl = src.elements[se]
+                        if (tEl.subStyle === sEl.subStyle) {
+                            // Copy manual X/Y offset nudges
+                            tEl.offset = Qt.point(sEl.offsetX, sEl.offsetY)
+
+                            // Only apply 4.6+ frame-position / text-align if exposed as valid numeric enums
+                            if (sEl.hasPositionProp && typeof tEl.position === "number")
+                                tEl.position = sEl.positionVal
+                            if (sEl.hasAlignProp && typeof tEl.align === "number")
+                                tEl.align = sEl.alignVal
+
+                            break
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    function extractInstrumentTokens(title) {
+        if (!title)
+            return []
+
+        // Remove trailing part numbers, roman numerals, or division letters (e.g., "1", "II", "1 & 2", "A")
+        var cleaned = title.replace(/[\s,.-]+(\d+(\s*[&/,-]\s*\d+)*|[IVX]+|[A-Z])$/i, "").trim()
+
+        // Split on whitespace, slashes, hyphens, parentheses
+        var rawWords = cleaned.split(/[\s/()\-]+/)
+        var tokens = []
+
+        for (var i = 0; i < rawWords.length; i++) {
+            var w = rawWords[i].replace(/^[^A-Za-zÀ-ÖØ-öø-ÿ]+|[^A-Za-zÀ-ÖØ-öø-ÿ]+$/g, "")
+            if (!w)
+                continue
+
+            // Ignore lowercase connector words ("in", "en", "de", "of", "the", "und", etc.)
+            var firstChar = w.charAt(0)
+            if (firstChar === firstChar.toLowerCase() && firstChar !== firstChar.toUpperCase())
+                continue
+
+            // Ignore ordinals like "1st", "2nd" and standalone key/transposition labels ("Bb", "Eb", "F", "C", "F#", etc.)
+            if (/^\d+(st|nd|rd|th)$/i.test(w))
+                continue
+            if (/^[A-G]([b#♯♭])?$/.test(w))
+                continue
+
+            tokens.push(w.toLowerCase())
+        }
+
+        return tokens
     }
 
     function shouldPreselectPart(currTitle, targetTitle) {
         if (!currTitle || !targetTitle)
             return false
 
-        var cBase = stripPartNumber(currTitle)
-        var tBase = stripPartNumber(targetTitle)
+        var cTokens = extractInstrumentTokens(currTitle)
+        var tTokens = extractInstrumentTokens(targetTitle)
 
-        if (cBase.length > 0 && cBase === tBase)
-            return true
+        if (cTokens.length === 0 || tTokens.length === 0)
+            return false
 
-        return getSimilarityScore(cBase, tBase) >= 4
-    }
+        // Check if every significant token in the shorter name appears in the longer name
+        var shorter = cTokens.length <= tTokens.length ? cTokens : tTokens
+        var longer = cTokens.length <= tTokens.length ? tTokens : cTokens
 
-    function getSimilarityScore(s1, s2) {
-        var maxLen = 0
-        for (var i = 0; i < s1.length; i++) {
-            for (var j = i + 3; j <= s1.length; j++) {
-                var sub = s1.substring(i, j)
-                if (s2.indexOf(sub) !== -1 && sub.length > maxLen)
-                    maxLen = sub.length
-            }
+        var matches = 0
+        for (var i = 0; i < shorter.length; i++) {
+            if (longer.indexOf(shorter[i]) !== -1)
+                matches++
         }
-        return maxLen
+
+        return matches === shorter.length
     }
 
     function updateAllCheckboxState() {
@@ -209,7 +420,7 @@ MuseScore {
 
         var partsList = curScore.excerpts
 
-        // Pass 1: add breaks and nobreaks to selected parts in a single undo command
+        // Pass 1: add breaks, nobreaks, and frame layouts to selected parts in a single undo command
         curScore.startCmd()
         for (var i = 0; i < selectedIndices.length; i++) {
             var partIdx = selectedIndices[i]
@@ -231,6 +442,9 @@ MuseScore {
                 )
                 if (pendingLockedStart.length > 0)
                     lockSystemRangesInPart(destPart, pendingLockedStart, pendingLockedEnd)
+
+                if (copyFramesCheckbox.checked)
+                    applyFramesToPart(destPart, pendingFrames)
             }
         }
         curScore.endCmd()
@@ -317,6 +531,9 @@ MuseScore {
     }
 
     function unlockSystemsInPart(part) {
+        if (!part)
+            return
+
         if (part.systems) {
             for (var s = 0; s < part.systems.length; s++) {
                 var sys = part.systems[s]
@@ -324,6 +541,21 @@ MuseScore {
                     sys.isLocked = false
             }
         }
+
+        // Remove all existing layout breaks (page, line, nobreak, and optionally section)
+        var toRemove = []
+        for (var m = part.firstMeasure; m; m = m.nextMeasure) {
+            var me = m.elements
+            for (var mei = 0; mei < me.length; ++mei) {
+                var e = me[mei]
+                if (e.type == Element.LAYOUT_BREAK) {
+                    if (e.layoutBreakType != LayoutBreak.SECTION || exportSectionBreaks)
+                        toRemove.push(e)
+                }
+            }
+        }
+        for (var r = 0; r < toRemove.length; r++)
+            removeElement(toRemove[r])
     }
 
     function lockSystemsInPart(part) {
@@ -463,6 +695,17 @@ MuseScore {
         }
 
         CheckBox {
+            id: copyFramesCheckbox
+
+            text: qsTr("Copy frame heights, margins & text positions")
+            checked: true
+        }
+
+        MenuSeparator {
+            Layout.fillWidth: true
+        }
+
+        CheckBox {
             id: selectAllCheckbox
 
             text: qsTr("All Parts")
@@ -570,7 +813,7 @@ MuseScore {
         onRejected: quit()
 
         Label {
-            text: qsTr("No layout breaks or locked systems were found in the current score.")
+            text: qsTr("No layout breaks, locked systems, or frames were found in the current score.")
         }
     }
 }

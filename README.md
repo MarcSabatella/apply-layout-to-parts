@@ -1,6 +1,6 @@
 # Apply Layout to Parts
 
-Applies the current score or part system layout to selected parts.
+Applies the current score or part layout (systems and frames) to selected parts.
 
 ## Usage
 
